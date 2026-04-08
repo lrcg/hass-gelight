@@ -17,13 +17,14 @@ Home Assistant 2026.4+ compatible:
 - Device packet generation still uses internal mired conversion
 - Explicit supported_color_modes and color_mode
 - Added debug logging for troubleshooting
+- Added reliable critical-command retry profile
 """
 
 import logging
 import sys
 import threading
 from datetime import timedelta
-from time import sleep
+from time import sleep, time
 
 import voluptuous as vol
 
@@ -93,6 +94,80 @@ PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
     }
 )
 
+def callback(mesh, data):
+    _LOGGER.debug("callback raw data=%r", data)
+    try:
+        if len(data) < 11:
+            _LOGGER.debug("callback short packet: %r", data)
+            return
+
+        if data[7] != 0xDC:
+            _LOGGER.debug("callback ignoring packet type=0x%02X data=%r", data[7], data)
+            return
+
+        responses = data[10:]
+        _LOGGER.debug("callback status packet raw=%r responses=%r", data, responses)
+
+        for i in range(0, len(responses), 4):
+            response = responses[i:i + 4]
+            if len(response) < 4:
+                break
+
+            devid = response[0]
+            if devid == 0:
+                break
+
+            _LOGGER.debug("callback parsed devid=%s response=%r", devid, response)
+            device = mesh.devices.get(devid)
+            if device is None:
+                _LOGGER.debug("callback unknown device id=%s response=%r", devid, response)
+                continue
+
+            brightness = response[2]
+
+            if brightness >= 128:
+                brightness = brightness - 128
+                red = int(((response[3] & 0xE0) >> 5) * 255 / 7)
+                green = int(((response[3] & 0x1C) >> 2) * 255 / 7)
+                blue = int((response[3] & 0x03) * 255 / 3)
+
+                device.red = red
+                device.green = green
+                device.blue = blue
+                device._hs_color = colorutil.color_RGB_to_hs(red, green, blue)
+                device._last_confirmed_hs = device._hs_color
+                device._device_last_temp_value = None
+                device._attr_color_mode = ColorMode.HS
+                device._last_confirmed_at = time()
+            else:
+                # raw device temp byte; convert later once scale is confirmed
+                device._device_last_temp_value = response[3]
+                device._last_confirmed_hs = None
+                device._attr_color_mode = ColorMode.COLOR_TEMP
+
+            device._brightness = 255 * brightness // 100
+
+            _LOGGER.debug(
+                "%s confirmed state mode=%s brightness=%s hs=%s raw_temp=%s",
+                device._name,
+                device._attr_color_mode,
+                device._brightness,
+                getattr(device, "_hs_color", None),
+                getattr(device, "_device_last_temp_value", None),
+            )
+
+            device.schedule_update_ha_state()
+
+            _LOGGER.debug(
+                "callback device=%s brightness=%s mode=%s raw=%r",
+                device._name,
+                device._brightness,
+                device._attr_color_mode,
+                response,
+            )
+
+    except Exception:
+        _LOGGER.exception("callback failed data=%r", data)
 
 async def async_setup_platform(hass, config, async_add_devices, discovery_info=None):
     """Set up GE light platform."""
@@ -169,6 +244,9 @@ class GEDevice(LightEntity):
         self.red = 0
         self.green = 0
         self.blue = 0
+        self._pending_hs_target = None
+        self._last_confirmed_hs = None
+        self._last_confirmed_at = 0
 
         # HA-facing Kelvin API
         self._attr_min_color_temp_kelvin = 2000   # warmest supported
@@ -176,9 +254,6 @@ class GEDevice(LightEntity):
         self._color_temp_kelvin = 2000
 
         # Internal device-side mired values preserved from original logic
-        # original:
-        #   _min_mireds = mired(7000K) = coldest
-        #   _max_mireds = mired(2000K) = warmest
         self._device_min_mireds = colorutil.color_temperature_kelvin_to_mired(7000)
         self._device_max_mireds = colorutil.color_temperature_kelvin_to_mired(2000)
 
@@ -301,8 +376,24 @@ class GEDevice(LightEntity):
             await self.hass.async_add_executor_job(self.set_brightness, brightness)
 
         if ATTR_HS_COLOR in kwargs and self.support_rgb():
-            _LOGGER.debug("%s requested hs_color=%s", self._name, kwargs[ATTR_HS_COLOR])
-            await self.hass.async_add_executor_job(self.set_hs, kwargs[ATTR_HS_COLOR])
+            requested_hs = kwargs[ATTR_HS_COLOR]
+            _LOGGER.debug("%s requested hs_color=%s", self._name, requested_hs)
+
+            if self.support_color_temp():
+                mapped_kelvin = self.hs_to_white_kelvin(requested_hs)
+                if mapped_kelvin is not None:
+                    _LOGGER.debug(
+                        "%s remapping white-ish hs_color=%s to color_temp_kelvin=%s",
+                        self._name,
+                        requested_hs,
+                        mapped_kelvin,
+                    )
+                    await self.hass.async_add_executor_job(
+                        self.set_color_temp_kelvin, mapped_kelvin
+                    )
+                    return
+
+            await self.hass.async_add_executor_job(self.set_hs, requested_hs)
             return
 
         color_temp_kelvin = kwargs.get(ATTR_COLOR_TEMP_KELVIN)
@@ -329,7 +420,12 @@ class GEDevice(LightEntity):
 
     def set_power(self, power):
         _LOGGER.debug("%s set_power power=%s", self._name, power)
-        self.network.send_packet(self.id, 0xD0, [int(power)])
+        self.network.send_critical_command(
+            self.id,
+            "power",
+            0xD0,
+            [int(power)],
+        )
         self.power = power
 
     def set_brightness(self, brightness):
@@ -340,17 +436,24 @@ class GEDevice(LightEntity):
             brightness,
             device_brightness,
         )
-        self.network.send_packet(self.id, 0xD2, [device_brightness])
+        self.network.send_critical_command(
+            self.id,
+            "brightness",
+            0xD2,
+            [device_brightness],
+        )
         self._brightness = brightness
 
     def set_hs(self, hs_color):
-        self._hs_color = hs_color
+        self._pending_hs_target = hs_color
+
         hue, saturation = hs_color
         red, green, blue = colorutil.color_hsv_to_RGB(
             hue, saturation, self._brightness * 100 / 255
         )
+
         _LOGGER.debug(
-            "%s set_hs hs=%s rgb=(%s,%s,%s) brightness=%s",
+            "%s set_hs target_hs=%s rgb=(%s,%s,%s) brightness=%s",
             self._name,
             hs_color,
             red,
@@ -358,7 +461,63 @@ class GEDevice(LightEntity):
             blue,
             self._brightness,
         )
-        self.network.send_packet(self.id, 0xE2, [0x04, red, green, blue])
+
+        def _send():
+            self.network.send_critical_command(
+                self.id,
+                "hs_color",
+                0xE2,
+                [0x04, red, green, blue],
+            )
+
+        # Clear old confirmation before sending so we only accept fresh callback data
+        self._last_confirmed_hs = None
+        self._last_confirmed_at = 0.0
+
+        # First attempt
+        _send()
+
+        # Give callback time to report the bulb's confirmed state
+        sleep(0.45)
+
+        if self.hs_matches(hs_color):
+            _LOGGER.debug(
+                "%s hs confirmed after first attempt target=%s confirmed=%s",
+                self._name,
+                hs_color,
+                self._last_confirmed_hs,
+            )
+        else:
+            _LOGGER.debug(
+                "%s hs NOT confirmed after first attempt target=%s confirmed=%s; retrying",
+                self._name,
+                hs_color,
+                self._last_confirmed_hs,
+            )
+
+            # Retry this bulb only
+            self._last_confirmed_hs = None
+            self._last_confirmed_at = 0.0
+            _send()
+            sleep(0.45)
+
+            if self.hs_matches(hs_color):
+                _LOGGER.debug(
+                    "%s hs confirmed after retry target=%s confirmed=%s",
+                    self._name,
+                    hs_color,
+                    self._last_confirmed_hs,
+                )
+            else:
+                _LOGGER.warning(
+                    "%s hs still not confirmed after retry target=%s confirmed=%s",
+                    self._name,
+                    hs_color,
+                    self._last_confirmed_hs,
+                )
+
+        # Keep optimistic state for HA
+        self._hs_color = hs_color
         self.red = red
         self.green = green
         self.blue = blue
@@ -396,7 +555,12 @@ class GEDevice(LightEntity):
             self._attr_color_mode,
         )
 
-        self.network.send_packet(self.id, 0xE2, [0x05, value])
+        self.network.send_critical_command(
+            self.id,
+            "color_temp",
+            0xE2,
+            [0x05, value],
+        )
 
         if self._brightness > 0:
             resend_brightness = 100 * self._brightness // 255
@@ -406,10 +570,65 @@ class GEDevice(LightEntity):
                 self._brightness,
                 resend_brightness,
             )
-            self.network.send_packet(self.id, 0xD2, [resend_brightness])
+            self.network.send_critical_command(
+                self.id,
+                "brightness_after_white",
+                0xD2,
+                [resend_brightness],
+            )
 
         self._color_temp_kelvin = color_temp_kelvin
         self._attr_color_mode = ColorMode.COLOR_TEMP
+
+    def hs_matches(self, target_hs, hue_tolerance=8, sat_tolerance=10, max_age=2.0):
+        if self._attr_color_mode != ColorMode.HS:
+            return False
+
+        if self._last_confirmed_hs is None:
+            return False
+
+        if (time() - self._last_confirmed_at) > max_age:
+            return False
+
+        hue, sat = self._last_confirmed_hs
+        target_hue, target_sat = target_hs
+
+        hue_diff = abs(hue - target_hue)
+        hue_diff = min(hue_diff, 360 - hue_diff)
+
+        return hue_diff <= hue_tolerance and abs(sat - target_sat) <= sat_tolerance
+
+    def hs_to_white_kelvin(self, hs_color):
+        """
+        Narrow remap for HomeKit/Siri white-ish HS requests.
+
+        Only remap warm-white/daylight style HS values that are low-saturation
+        and close to the white range Siri appears to use.
+
+        Returns:
+            Kelvin int if this should be treated as white mode
+            None otherwise
+        """
+        hue, saturation = hs_color
+
+        # Very low saturation: treat as neutral white
+        if saturation <= 8:
+            return 4000
+
+        # Narrow warm-white/daylight band seen from Siri/HomeKit voice requests.
+        # Example observed: (31.0, 33.0)
+        if 20 <= hue <= 45 and saturation <= 35:
+            # Map warm -> cooler white across a restrained range.
+            # 20 hue => 2700K
+            # 45 hue => 5000K
+            kelvin = int(2700 + (hue - 20) * (5000 - 2700) / (45 - 20))
+            kelvin = max(
+                self._attr_min_color_temp_kelvin,
+                min(self._attr_max_color_temp_kelvin, kelvin),
+            )
+            return kelvin
+
+        return None
 
     def update(self):
         _LOGGER.debug("%s manual update packet", self._name)
@@ -429,6 +648,12 @@ class laurel_mesh:
         self.link = None
         self.lock = threading.Lock()
 
+        # Reliability tuning for critical commands
+        self.critical_repeat_count = 2
+        self.critical_inter_packet_delay = 0.15
+        self.connect_retry_count = 3
+        self.connect_retry_delay = 1.0
+
     def __del__(self):
         if self.link and self.link.device:
             self.link.device.disconnect()
@@ -439,22 +664,41 @@ class laurel_mesh:
             return
 
         _LOGGER.debug("Attempting mesh connect for account=%s", self.address)
+        last_error = None
 
         for device in self.devices.values():
             try:
-                _LOGGER.debug("Trying mesh device mac=%s id=%s name=%s", device.mac, device.id, device.name)
+                _LOGGER.debug(
+                    "Trying mesh device mac=%s id=%s name=%s",
+                    device.mac,
+                    device.id,
+                    device.name,
+                )
                 self.link = dimond.dimond(
-                    0x0211, device.mac, self.address, self.password
+                    0x0211, device.mac, self.address, self.password, self, callback
                 )
                 self.link.connect()
-                _LOGGER.debug("Connected to mesh via mac=%s id=%s", device.mac, device.id)
-                break
-            except Exception:
-                _LOGGER.exception("Failed to connect to %s", device.mac)
+                _LOGGER.debug(
+                    "Connected to mesh via mac=%s id=%s name=%s",
+                    device.mac,
+                    device.id,
+                    device.name,
+                )
+                return
+            except Exception as err:
+                last_error = err
+                _LOGGER.exception(
+                    "Connect failed mac=%s id=%s name=%s error=%r",
+                    device.mac,
+                    device.id,
+                    device.name,
+                    err,
+                )
                 self.link = None
 
-        if self.link is None:
-            raise Exception(f"Unable to connect to mesh {self.address}")
+        raise Exception(
+            f"Unable to connect to mesh {self.address}; last_error={last_error!r}"
+        )
 
     def send_packet(self, id_, command, params):
         with self.lock:
@@ -466,6 +710,8 @@ class laurel_mesh:
                 self.link is not None,
             )
             try:
+                if self.link is None:
+                    self.connect()
                 self.link.send_packet(id_, command, params)
             except Exception as err:
                 _LOGGER.exception(
@@ -476,21 +722,62 @@ class laurel_mesh:
                     err,
                 )
                 self.link = None
-                try:
-                    self.connect()
-                    _LOGGER.debug("mesh reconnected, retrying packet")
-                    self.link.send_packet(id_, command, params)
-                except Exception as err2:
-                    _LOGGER.exception(
-                        "mesh retry failed id=%s command=0x%02X params=%s error=%r",
-                        id_,
-                        command,
-                        params,
-                        err2,
-                    )
+                self.connect()
+                _LOGGER.debug("mesh reconnected, retrying packet once")
+                self.link.send_packet(id_, command, params)
             sleep(0.05)
+
+    def send_critical_command(self, id_, label, command, params):
+        """
+        Safer critical-command profile:
+        - ensure mesh is connected once
+        - send packet
+        - if still connected, send same packet a second time
+        - do not repeatedly reconnect in a loop
+        """
+        _LOGGER.debug(
+            "critical command start id=%s label=%s command=0x%02X params=%s",
+            id_,
+            label,
+            command,
+            params,
+        )
+
+        # First send: may connect if needed
+        self.send_packet(id_, command, params)
+
+        # Second send: only replay if link still exists
+        if self.link is not None:
+            sleep(0.15)
+            try:
+                _LOGGER.debug(
+                    "critical command replay id=%s label=%s command=0x%02X params=%s",
+                    id_,
+                    label,
+                    command,
+                    params,
+                )
+                self.link.send_packet(id_, command, params)
+                sleep(0.05)
+            except Exception as err:
+                _LOGGER.exception(
+                    "critical command replay failed id=%s label=%s command=0x%02X params=%s error=%r",
+                    id_,
+                    label,
+                    command,
+                    params,
+                    err,
+                )
+                self.link = None
+
+        _LOGGER.debug(
+            "critical command done id=%s label=%s command=0x%02X params=%s",
+            id_,
+            label,
+            command,
+            params,
+        )
 
     def update_status(self):
         _LOGGER.debug("Broadcast mesh status update")
         self.send_packet(0xFFFF, 0xDA, [])
-
